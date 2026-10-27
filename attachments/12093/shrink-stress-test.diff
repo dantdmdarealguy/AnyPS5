@@ -1,0 +1,42 @@
+diff --git a/core/libs/tests/GuestKqueue.cpp b/core/libs/tests/GuestKqueue.cpp
+index 7b81a77b4a..403aec85ef 100644
+--- a/core/libs/tests/GuestKqueue.cpp
++++ b/core/libs/tests/GuestKqueue.cpp
+@@ -1091,6 +1091,29 @@ static void FileWatch() {
+     Require(std::filesystem::remove(path));
+ }
+ 
++#ifdef _WIN32
++static void ShrinkingFileReportsNoWrite() {
++    const auto path = TemporaryName("shrink");
++    const int file = open_nid_postfix(path.c_str(), ReadWrite | Create, 0644);
++    Require(file >= 0);
++    std::int64_t size = std::int64_t{1} << 22;
++    Require(ftruncate_nid_postfix(file, size) == 0);
++    const int kq = kqueue_nid_postfix();
++    KernelEvent events[4]{};
++    Require(Apply(kq, Change(static_cast<std::uintptr_t>(file), EvfiltVnode, EvAdd | EvClear, NoteWrite | NoteExtend)) == 0);
++    Require(Poll(kq, events, 4) == 0);
++    const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(2);
++    while (size > 0 && std::chrono::steady_clock::now() < until) {
++        Require(ftruncate_nid_postfix(file, --size) == 0);
++    }
++    std::this_thread::sleep_for(std::chrono::milliseconds(200));
++    Require(Poll(kq, events, 4) == 0);
++    Require(close_nid_postfix(kq) == 0);
++    Require(close_nid_postfix(file) == 0);
++    Require(std::filesystem::remove(path));
++}
++#endif
++
+ #ifndef _WIN32
+ static void RenameAndDeleteWatchedFile() {
+     const auto path = TemporaryName("moved");
+@@ -1506,6 +1529,7 @@ int main() {
+ #endif
+ #ifdef _WIN32
+     RecycleBinDeleteWatchedFile();
++    ShrinkingFileReportsNoWrite();
+ #endif
+ #if !defined(_WIN32) && !defined(__APPLE__)
+     MoveDirectoryEntries();
