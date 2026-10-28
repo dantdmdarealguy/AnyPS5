@@ -1,0 +1,74 @@
+diff --git a/core/libs/prx/libSceAgcDriver/Execution/src/Driver/Queues/QueueWorker.cpp b/core/libs/prx/libSceAgcDriver/Execution/src/Driver/Queues/QueueWorker.cpp
+index b6a5b5689..7b4050e2c 100644
+--- a/core/libs/prx/libSceAgcDriver/Execution/src/Driver/Queues/QueueWorker.cpp
++++ b/core/libs/prx/libSceAgcDriver/Execution/src/Driver/Queues/QueueWorker.cpp
+@@ -12,6 +12,8 @@
+ #include <algorithm>
+ #include <chrono>
+ #include <cstdlib>
++#include <cstdio>
++#include <thread>
+ 
+ namespace AgcDriver::DriverDetail {
+ 
+@@ -226,6 +228,7 @@ void Driver::run(std::uint32_t id) noexcept {
+                         const auto idleEpochAtWait = idleEpoch.load(std::memory_order_acquire);
+                         changed.wait(lock, [&] { return ready() || (id == 0 && (idleEpoch.load(std::memory_order_acquire) != idleEpochAtWait || completionsPending())); });
+                         if (id == 0) queue0Dormant.store(false, std::memory_order_relaxed);
++                        if (id == 0 && std::getenv("CF2_WIDEN") != nullptr) { lock.unlock(); std::this_thread::sleep_for(std::chrono::microseconds(std::atoi(std::getenv("CF2_WIDEN")))); lock.lock(); }
+                         if (id == 0 && !ready() && (idleEpoch.load(std::memory_order_acquire) != idleEpochAtWait || completionsPending())) continue;
+                         break;
+                     }
+@@ -286,10 +289,13 @@ void Driver::run(std::uint32_t id) noexcept {
+             else ++costs.notifiesSkipped;
+             if (profile) costs.completeNs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - completeStart).count());
+         }
++        std::fprintf(stderr, "DIAG worker 0x%x left its loop stopping=%d pending=%zu\n", id, stopping ? 1 : 0, workers.at(id).pending.size());
+     } catch (const ProcessShutdown&) {
++        std::fprintf(stderr, "DIAG worker 0x%x shutdown\n", id);
+         submission = Submission{};
+     } catch (...) {
+         const auto error = std::current_exception();
++        try { std::rethrow_exception(error); } catch (const std::exception& e) { std::fprintf(stderr, "DIAG worker 0x%x failed: %s\n", id, e.what()); } catch (...) { std::fprintf(stderr, "DIAG worker 0x%x failed: non-std\n", id); }
+         for (const auto& [offset, flip] : submission.flips) flip->Fail(error);
+         ReportFailure(error);
+     }
+diff --git a/core/libs/prx/libSceAgcDriver/tests/execution/SubmitProgress.cpp b/core/libs/prx/libSceAgcDriver/tests/execution/SubmitProgress.cpp
+index 1996782ef..9a8fb55a5 100644
+--- a/core/libs/prx/libSceAgcDriver/tests/execution/SubmitProgress.cpp
++++ b/core/libs/prx/libSceAgcDriver/tests/execution/SubmitProgress.cpp
+@@ -8,6 +8,9 @@
+ #include <cstdint>
+ #include <cstdlib>
+ #include <cstring>
++#include <cstdio>
++#include <unistd.h>
++#include <sys/prctl.h>
+ #include <iostream>
+ #include <stdexcept>
+ #include <thread>
+@@ -35,16 +38,22 @@ void Release(std::vector<std::uint32_t>& words, const void* label, std::uint32_t
+     words.insert(words.end(), {0xc0064900u, 0x514u, (2u << 29u) | (interrupt << 24u), Low(label), High(label), value, 0u, 0u});
+ }
+ void Await(const std::uint32_t* label, std::uint32_t value) {
+-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
++    const auto start = std::chrono::steady_clock::now();
++    const auto deadline = start + std::chrono::seconds(2);
++    bool late = false;
+     while (*static_cast<const volatile std::uint32_t*>(label) != value) {
+-        Require(std::chrono::steady_clock::now() < deadline, "submission lost its real GPU completion store");
++        if (std::chrono::steady_clock::now() >= deadline && !late) { late = true; std::fprintf(stderr, "DIAG late value=%u label=%u\n", value, *static_cast<const volatile std::uint32_t*>(label)); char command[256]; std::snprintf(command, sizeof command, "eu-stack -p %d > $HOME/cf2-out/stack-%d.txt 2>&1", (int)getpid(), (int)getpid()); std::system(command); std::fprintf(stderr, "DIAG after stack label=%u\n", *static_cast<const volatile std::uint32_t*>(label)); }
++        if (std::chrono::steady_clock::now() >= start + std::chrono::seconds(12)) { std::fprintf(stderr, "DIAG never value=%u label=%u\n", value, *static_cast<const volatile std::uint32_t*>(label)); break; }
+         std::this_thread::yield();
+     }
++    if (late) std::fprintf(stderr, "DIAG arrived value=%u after %lld ms\n", value, (long long)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count());
++    Require(!late, "submission lost its real GPU completion store");
+     AgcDriverWaitIdle_nid_postfix();
+ }
+ }
+ 
+ int main() {
++    prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0);
+     void* block = nullptr;
+     try {
+         auto device = OpenVulkanTestDevice(); if (!device) return VulkanTestSkipped; device.reset();
